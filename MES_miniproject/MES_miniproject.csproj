@@ -86,5 +86,13 @@
   <ItemGroup>
     <None Include="App.config" />
   </ItemGroup>
+  <ItemGroup>
+    <Content Include="Procedure\[99PP_ActualOutPut_I5].sql" />
+    <Content Include="Procedure\[99QM_BadProdAN_S1].sql" />
+    <Content Include="Procedure\[99QM_BadProdQM_D1].sql" />
+    <Content Include="Procedure\[99QM_BadProdQM_I1].sql" />
+    <Content Include="Procedure\[99QM_BadProdQM_S1].sql" />
+    <Content Include="Procedure\[99QM_BadProdrec_S1].sql" />
+  </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>

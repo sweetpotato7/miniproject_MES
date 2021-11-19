@@ -1,0 +1,252 @@
+﻿USE [KFQB_MES_2021]
+GO
+/****** Object:  StoredProcedure [dbo].[99PP_ActualOutPut_I5]    Script Date: 2021-07-16 오후 3:38:34 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+-- =============================================
+-- Author:		1조
+-- Create date: 2021-07-09
+-- Description:	생산 실적 등록 (양품 불량 실적 등록)
+-- =============================================
+ALTER PROCEDURE [dbo].[99PP_ActualOutPut_I5]
+	 @PLANTCODE		 VARCHAR(10) -- 공장
+	,@WORKCENTERCODE VARCHAR(10) -- 작업장
+	,@ORDERNO		 VARCHAR(30) -- 작업지시번호
+	,@ITEMCODE		 VARCHAR(30) -- 품목
+	,@UNITCODE		 VARCHAR(10) -- 단위
+	,@PRODQTY		 FLOAT       -- 양품 수량
+	,@BADQTY		 FLOAT       -- 불량 수량
+	,@MATLOTNO		 VARCHAR(30) -- 
+	,@WORKER         VARCHAR(20) -- 작업자
+
+	,@LANG           VARCHAR(10) = 'KO'
+	,@RS_CODE        VARCHAR(1)   OUTPUT
+	,@RS_MSG         VARCHAR(200) OUTPUT
+AS
+BEGIN
+-- 현재시간 정의공통 변수
+	DECLARE @LD_NOWDATE DATETIME
+	       ,@LS_NOWDATE VARCHAR(10)
+	    SET @LD_NOWDATE = GETDATE()
+		SET @LS_NOWDATE = CONVERT(VARCHAR, @LD_NOWDATE, 23)
+
+-- 작업장 등록 작업자 조회
+	DECLARE @LS_WORKER   VARCHAR(20)
+     SELECT @LS_WORKER = WORKER
+	   FROM TP_WorkcenterStatus WITH(NOLOCK)
+	  WHERE PLANTCODE      = @PLANTCODE
+	    AND WORKCENTERCODE = @WORKCENTERCODE
+	
+	IF ( ISNULL(@LS_WORKER, '') = '')
+	BEGIN
+		SET @RS_CODE = 'E'
+		SET @RS_MSG  = '등록된 작업자가 없습니다.'
+		RETURN;
+	END
+
+	IF ( ISNULL(@ORDERNO, '') = '')
+	BEGIN
+		SET @RS_CODE = 'E'
+		SET @RS_MSG  = '등록된 작업지시가 없습니다.'
+		RETURN;
+	END
+
+-- BOM 차감 수량 만큼 투입된 잔량이 남아있는지 확인
+	DECLARE @LF_TOTALQTY FLOAT
+	       ,@LF_FINALQTY FLOAT
+		   ,@LF_PRODQTY  FLOAT		  -- C(COMPONENT)
+		   ,@LS_CITEMCODE VARCHAR(30) -- 하위 품목 코드
+		   ,@LS_CUNITCODE VARCHAR(10) -- 하위 품목 단위
+		   ,@LF_STOCKQTY FLOAT		  -- 재공재고수량
+
+-- 투입 LOT 정보 등록
+	 SELECT @LS_CITEMCODE = ITEMCODE
+	       ,@LS_CUNITCODE = UNITCODE
+		   ,@LF_STOCKQTY  = STOCKQTY
+	   FROM TB_StockHALB WITH(NOLOCK)
+	  WHERE PLANTCODE     = @PLANTCODE
+	    AND LOTNO	      = @MATLOTNO -- 재공 재고에 투입된 LOTNO
+	
+--입력한 양품 + 불량 수량
+	SET @LF_TOTALQTY = ISNULL(@PRODQTY,0) + ISNULL(@BADQTY,0) 
+
+-- BOM 에서 차감될 수량 확인
+--SELECT * FROM TB_BomMaster with(nolock)
+-- TOTALQTY는 완성품 개수 => 100개 (부품 2개 이용)
+-- FINALYQTY는 부품 개수 => 200개
+ SELECT @LF_FINALQTY = ISNULL (COMPONENTQTY,1) * @LF_TOTALQTY
+       ,@LF_PRODQTY  = ISNULL (COMPONENTQTY,1) * ISNULL(@PRODQTY,0)
+   FROM TB_BomMaster WITH(NOLOCK)
+  WHERE PLANTCODE = @PLANTCODE
+    AND ITEMCODE  = @ITEMCODE
+	AND COMPONENT = @LS_CITEMCODE
+
+-- BOM에 차감될 수량의 정보가 없을 경우 생산 + 양품수량을 차감수량으로 간주
+	SET @LF_FINALQTY = ISNULL(@LF_FINALQTY,@LF_TOTALQTY)
+
+	IF ( ISNULL (@LF_FINALQTY,0) = 0)
+	BEGIN
+		SET @RS_CODE = 'E'
+		SET @RS_MSG  = 'BOM 차감 대상이 존재하지 않습니다.'
+		RETURN;
+	END
+
+	IF ( ISNULL(@LF_STOCKQTY,0) < @LF_FINALQTY )
+	BEGIN
+		SET @RS_CODE = 'E'
+		SET @RS_MSG  = '투입 잔량이 부족합니다.'
+		RETURN;
+	END
+
+-- 1. 작업지시 내역에 생산 정보 등록
+	UPDATE TB_ProductPlan
+	   SET PRODQTY        = ISNULL(PRODQTY,'0') + @PRODQTY
+	      ,BADQTY         = ISNULL(BADQTY, '0')  + @BADQTY
+		  ,EDITOR         = @LS_WORKER
+		  ,EDITDATE       = @LD_NOWDATE
+	 WHERE PLANTCODE      = @PLANTCODE
+	   AND ORDERNO        = @ORDERNO
+	   AND WORKCENTERCODE = @WORKCENTERCODE
+	   AND ORDERFLAG      = 'Y'
+
+-- 2. 가동 비가동 이력(TP_WORKCENTERSTATUSREC)에 생산 정보 등록
+	UPDATE TP_WorkcenterStatusRec
+	   SET PRODQTY        = ISNULL(PRODQTY,'0') + @PRODQTY
+	      ,BADQTY         = ISNULL(BADQTY, '0') + @BADQTY
+		  ,EDITOR         = @LS_WORKER
+		  ,EDITDATE       = @LD_NOWDATE
+	 WHERE PLANTCODE      = @PLANTCODE
+	   AND WORKCENTERCODE = @WORKCENTERCODE
+	   AND ORDERNO        = @ORDERNO
+	   AND RSSEQ		  = (SELECT MAX(RSSEQ)
+							   FROM TP_WorkcenterStatusRec WITH(NOLOCK)
+							  WHERE PLANTCODE      = @PLANTCODE
+								AND WORKCENTERCODE = @WORKCENTERCODE
+								AND ORDERNO        = @ORDERNO)
+
+-- 3. LOT TRACKING 등록
+	DECLARE @LI_SEQ INT
+	 SELECT @LI_SEQ = ISNULL(MAX(SEQ),0) + 1
+	   FROM TP_LotTracking WITH(NOLOCK)
+	  WHERE PLANTCODE      = @PLANTCODE
+		AND WORKCENTERCODE = @WORKCENTERCODE
+	    AND ORDERNO        = @ORDERNO
+
+	DECLARE @LS_LOTNO VARCHAR(30)
+	    SET @LS_LOTNO = 'LTFERT' + RIGHT(@ORDERNO, 4) + 'X'
+		              + RIGHT('0000' + CONVERT(VARCHAR,@LI_SEQ),4)
+
+	INSERT INTO TP_LotTracking														  -- LF_PRODQTY - 양품 수량
+			( PLANTCODE,   ORDERNO,       WORKCENTERCODE,  SEQ,       LOTNO,		  -- CUNITCODE - 품목단위
+			  ITEMCODE,    PRODQTY,       UNITCODE,        CLOTNO,    CITEMCODE,	  -- CLOTNO - 투입된 LOTNO
+			  INQTY,       CUNITCODE,     MAKEDATE, MAKER)							  
+	VALUES	( @PLANTCODE,  @ORDERNO,      @WORKCENTERCODE, @LI_SEQ,   @LS_LOTNO,  	  
+	          @ITEMCODE,   @PRODQTY,      @UNITCODE,       @MATLOTNO, @LS_CITEMCODE,  
+			  @LF_PRODQTY, @LS_CUNITCODE, @LD_NOWDATE,     @LS_WORKER)				  
+	
+
+
+-- 4. 작업장 별 생산 실적 등록
+	DECLARE @LI_PRODSEQ INT
+	 SELECT @LI_PRODSEQ = ISNULL(MAX(PRODSEQ),0) + 1
+	   FROM TP_WorkcenterPerProd WITH(NOLOCK)
+	  WHERE PLANTCODE      = @PLANTCODE
+		AND WORKCENTERCODE = @WORKCENTERCODE
+	    AND PRODDATE       = @LS_NOWDATE
+
+	INSERT INTO TP_WorkcenterPerProd
+		   ( PLANTCODE,  PRODSEQ,     WORKCENTERCODE,  PRODDATE,     ITEMCODE,
+		     ORDERNO,    PRODQTY,     BADQTY,          TOTALQTY,     UNITCODE,  INLOTNO,
+			 LOTNO,      MAKER,       MAKEDATE)
+	VALUES ( @PLANTCODE, @LI_PRODSEQ, @WORKCENTERCODE, @LS_NOWDATE,  @ITEMCODE,
+	         @ORDERNO,   @PRODQTY,    @BADQTY,         @LF_TOTALQTY, @UNITCODE, @MATLOTNO,
+	         @LS_LOTNO,  @LS_WORKER,  @LD_NOWDATE)
+------------------------------------------------------------------------------------
+-- 1. 불량 수량을 TB_BadProdQM에 입력
+	-- INDATESEQ 넣을 기본키용 변수 생성
+	DECLARE @LI_INDATESEQ INT
+	       ,@LS_INDATESEQ VARCHAR(20)
+		   
+	-- 날짜별 BADCODE 순번 채번
+	SELECT @LI_INDATESEQ = ISNULL(MAX(RIGHT(INDATESEQ,5)),0) + 1
+      FROM TB_BadProdQMrec WITH(NOLOCK)
+	  WHERE CONVERT(VARCHAR,MAKEDATE,23) = @LS_NOWDATE
+    
+	SET @LS_INDATESEQ = CONVERT(VARCHAR,GETDATE(),12) + RIGHT('00000' + CONVERT(VARCHAR,@LI_INDATESEQ),5)
+	
+	INSERT INTO TB_BadProdQM
+		   ( PLANTCODE,       INDATESEQ,     LOTNO,     DELFLAG,    ORDERNO,
+		     WORKCENTERCODE,  WORKERID,      ITEMCODE,  FIRSTBADQTY,
+			 BADQTY,          CHKNO,         MAKER,     MAKEDATE)
+	VALUES ( @PLANTCODE,      @LS_INDATESEQ, @MATLOTNO, 'N',        @ORDERNO,
+	         @WORKCENTERCODE, @LS_WORKER,    @ITEMCODE, @BADQTY,
+			 @BADQTY,         '1',           @WORKER,   @LD_NOWDATE)
+
+	INSERT INTO TB_BadProdQMrec
+		   ( PLANTCODE,       INDATESEQ,     LOTNO,     ORDERNO,  OUTCOME,
+		     WORKCENTERCODE,  WORKERID,      ITEMCODE,  FIRSTBADQTY,
+			 BADQTY,          CHKNO,         MAKER,     MAKEDATE)
+	VALUES ( @PLANTCODE,      @LS_INDATESEQ, @MATLOTNO, @ORDERNO, '불량',
+	         @WORKCENTERCODE, @LS_WORKER,    @ITEMCODE, @BADQTY,    
+			 @BADQTY,         '1',           @WORKER,   @LD_NOWDATE)
+	SET @RS_MSG  = '성공'
+
+
+--SELECT * FROM TB_BADPRODQMREC
+------------------------------------------------------------------------------------
+
+
+-- 5. 재공재고 차감 및 삭제
+	--@LF_STOCKQTY = 원자재 잔량
+	IF( ISNULL(@LF_STOCKQTY, 0) - @LF_FINALQTY) = 0
+	BEGIN
+		DELETE TB_StockHALB
+		 WHERE PLANTCODE = @PLANTCODE
+		   AND LOTNO     = @MATLOTNO
+	END
+
+	ELSE
+	BEGIN
+		UPDATE TB_StockHALB
+		   SET STOCKQTY = STOCKQTY - @LF_FINALQTY
+		 WHERE PLANTCODE = @PLANTCODE
+		   AND LOTNO     = @MATLOTNO
+	END
+
+-- 6. 재공 재고 차감 이력 등록
+	DECLARE @LI_INOUTSEQ INT
+	 SELECT @LI_INOUTSEQ = ISNULL(MAX(INOUTSEQ),0) + 1
+	   FROM TB_StockHALBrec WITH(NOLOCK)
+	  WHERE PLANTCODE = @PLANTCODE
+		AND RECDATE   = @LS_NOWDATE
+
+	INSERT INTO TB_StockHALBrec
+		   ( PLANTCODE,  INOUTSEQ,     RECDATE,      LOTNO,         ITEMCODE,      WORKCENTERCODE,
+		     INOUTFLAG,  INOUTCODE,    INOUTQTY,     UNITCODE,      MAKER,         MAKEDATE)
+	VALUES ( @PLANTCODE, @LI_INOUTSEQ, @LS_NOWDATE,  @MATLOTNO,     @LS_CITEMCODE, @WORKCENTERCODE,
+	         'O',        '40',         @LF_FINALQTY, @LS_CUNITCODE, @LS_WORKER,    @LD_NOWDATE)
+
+-- 7. 공정 재고 등록
+	INSERT INTO TB_StockPP
+		   ( PLANTCODE,  LOTNO,     ITEMCODE,  STOCKQTY, INDATE,      MAKEDATE,    MAKER)
+	VALUES ( @PLANTCODE, @LS_LOTNO, @ITEMCODE, @PRODQTY, @LS_NOWDATE, @LD_NOWDATE, @LS_WORKER)
+-- 조업시간 = 야간조가 밤 12시를 넘겨도 다음날 8시까지는 오늘 한걸로 취급
+-- 그래서 INDATE에 @LS_NOWDATE를 입력
+
+-- 8. 공정재고 입고 이력 등록
+	 SELECT @LI_INOUTSEQ = ISNULL(MAX(INOUTSEQ),0) + 1
+	   FROM TB_StockPPrec WITH(NOLOCK)
+	  WHERE PLANTCODE = @PLANTCODE
+		AND RECDATE   = @LS_NOWDATE
+
+	INSERT INTO TB_StockPPrec
+		   ( PLANTCODE,  INOUTSEQ,     RECDATE,     LOTNO,     ITEMCODE,    WHCODE, 
+		     INOUTFLAG,  INOUTCODE,    INOUTQTY,    UNITCODE,  MAKEDATE,    MAKER)
+	VALUES ( @PLANTCODE, @LI_INOUTSEQ, @LS_NOWDATE, @LS_LOTNO, @ITEMCODE,   'WH003', 
+	         'I',        '45',         @PRODQTY,    @UNITCODE, @LD_NOWDATE, @LS_WORKER)
+
+	SET @RS_CODE = 'S'
+END

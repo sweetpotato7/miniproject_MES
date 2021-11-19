@@ -1,0 +1,169 @@
+﻿USE [KFQB_MES_2021]
+GO
+/****** Object:  StoredProcedure [dbo].[99QM_BadProdQM_I1]    Script Date: 2021-07-16 오후 3:38:41 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+-- =============================================
+-- Author:		1조
+-- Create date: 2021-07-12
+-- Description:	불량 내역 조회 및 재검사 등록
+-- =============================================
+ALTER PROCEDURE [dbo].[99QM_BadProdQM_I1]
+	 @PLANTCODE      VARCHAR(10)  -- 공장			
+	,@INDATESEQ	     VARCHAR(20)  -- INDATESEQ	
+	,@PRODQTY	     FLOAT		  -- 양품수량	
+	,@DELFLAG	     VARCHAR(10)	  -- 폐기여부	
+	,@REMARK	     VARCHAR(200) -- 사유		
+	,@ORDERNO        VARCHAR(20)  -- ORDERNO	
+	,@WORKCENTERCODE VARCHAR(20)  -- 작업장 코드
+	,@ITEMCODE		 VARCHAR(20)  -- 품목		
+	,@LOTNO          VARCHAR(30)  -- LOTNO		
+	,@WORKERID       VARCHAR(20)  -- 작업자		 
+	,@BADQTY		 FLOAT		  -- 불량수량
+	,@FIRSTBADQTY    FLOAT        -- 초기 불량 수량
+
+	,@LANG	         VARCHAR(10)  = 'KO'
+	,@RS_CODE        VARCHAR(1)   OUTPUT
+	,@RS_MSG         VARCHAR(200) OUTPUT
+AS
+BEGIN
+-- 현재시간 정의공통 변수
+	DECLARE @LD_NOWDATE DATETIME
+	       ,@LS_NOWDATE VARCHAR(10)
+	    SET @LD_NOWDATE = GETDATE()
+		SET @LS_NOWDATE = CONVERT(VARCHAR, @LD_NOWDATE, 23)
+
+-- 양품 수량이 없을 때
+	IF( ISNULL(@PRODQTY, '') = '')
+	BEGIN
+		SET @RS_CODE = 'E'
+		SET @RS_MSG  = '양품수량을 입력해 주세요.'
+		RETURN;
+	END
+
+-- 양품 > 남은 불량 체크
+	IF ( @BADQTY < @PRODQTY)
+	BEGIN
+		SET @RS_CODE = 'E'
+		SET @RS_MSG  = '양품수량이 남은 불량 수량을 초과하였습니다.'
+		RETURN;
+	END
+
+-- ITEMCODE, UNITCODE 선언
+	DECLARE @LS_CITEMCODE VARCHAR(30) -- 하위 품목 코드
+			,@LS_CUNITCODE VARCHAR(10) -- 하위 품목 단위
+			,@LS_UNITCODE VARCHAR(10)
+
+-- UNITCODE 획득
+	SELECT DISTINCT @LS_UNITCODE = ISNULL(B.UNITCODE, '')
+	  FROM TB_BadProdQM A WITH(NOLOCK) LEFT JOIN TB_ProductPlan B WITH(NOLOCK)
+	        						          ON A.PLANTCODE = @PLANTCODE
+	  										 AND A.ITEMCODE  = B.ITEMCODE
+	 WHERE A.PLANTCODE = @PLANTCODE
+	   AND A.INDATESEQ = @INDATESEQ
+
+-- 투입 LOT 정보 등록
+	SELECT @LS_CITEMCODE = ISNULL(ITEMCODE, '')
+		  ,@LS_CUNITCODE = ISNULL(UNITCODE, '')
+	  FROM TB_StockHALB WITH(NOLOCK)
+	 WHERE PLANTCODE     = @PLANTCODE
+	   AND LOTNO         = @LOTNO
+
+-- LOT Tracking 번호 채번
+	DECLARE @LI_SEQ INT
+	 SELECT @LI_SEQ   = ISNULL(MAX(SEQ),0) + 1
+	   FROM TP_LotTracking WITH(NOLOCK)
+	  WHERE PLANTCODE = @PLANTCODE
+	    AND ORDERNO   = @ORDERNO
+
+	DECLARE @LS_LOTNO  VARCHAR(30)
+		SET @LS_LOTNO = 'LTFERTX' + RIGHT(@ORDERNO,4) + RIGHT('0000' + CONVERT(VARCHAR,@LI_SEQ),4)
+
+-- LOT Tracking 이력 추가
+	INSERT INTO TP_LotTracking (PLANTCODE,    ORDERNO,       WORKCENTERCODE,   SEQ,        LOTNO,
+								ITEMCODE,     PRODQTY,       UNITCODE,         CLOTNO,     CITEMCODE,
+								INQTY,        CUNITCODE,     MAKEDATE,         MAKER)	    
+						VALUES( @PLANTCODE,   @ORDERNO,      @WORKCENTERCODE,  @LI_SEQ,    @LS_LOTNO,
+								@ITEMCODE,    @PRODQTY,      @LS_UNITCODE,     @LOTNO,     @LS_CITEMCODE,
+								@PRODQTY,     @LS_CUNITCODE, @LD_NOWDATE,      @WORKERID) 
+
+-- 공정 재고 생성
+	INSERT INTO TB_StockPP
+		   ( PLANTCODE,  LOTNO,     ITEMCODE,  WHCODE,  STOCKQTY, INDATE,      REMARK,        MAKEDATE,    MAKER)
+	VALUES ( @PLANTCODE, @LS_LOTNO, @ITEMCODE, 'WH003', @PRODQTY, @LS_NOWDATE, '재검사 합격', @LD_NOWDATE, @WORKERID)
+
+-- 공정 창고 입고 이력 번호 채번
+	DECLARE @LI_INOUTSEQ INT 
+	 SELECT @LI_INOUTSEQ = ISNULL(MAX(INOUTSEQ),0) + 1
+	   FROM TB_StockPPrec WITH(NOLOCK)
+	  WHERE PLANTCODE = @PLANTCODE
+	    AND RECDATE   = @LS_NOWDATE
+
+-- 공정 창고 입고 이력 추가
+	INSERT INTO TB_StockPPrec(PLANTCODE,   INOUTSEQ,        RECDATE,        LOTNO,         ITEMCODE,    WHCODE,   INOUTFLAG,
+							  INOUTCODE,   INOUTQTY,        UNITCODE,       MAKEDATE,      MAKER)		  		    
+					  VALUES (@PLANTCODE,  @LI_INOUTSEQ,    @LS_NOWDATE,    @LS_LOTNO,     @ITEMCODE,   'WH003',  'I',
+							  '47',        @PRODQTY,        @LS_UNITCODE,   @LD_NOWDATE,   @WORKERID)
+
+-- TB_BadProdQM 검사 횟수 업데이트
+	UPDATE TB_BadProdQM
+	   SET CHKNO = ISNULL(CHKNO,0) + 1
+	  FROM TB_BadProdQM
+	 WHERE PLANTCODE = @PLANTCODE
+	   AND INDATESEQ = @INDATESEQ
+
+-- 작업자 받아오기
+	DECLARE @LS_WORKERID VARCHAR(20)
+	 SELECT @LS_WORKERID = WORKERID
+	   FROM TB_BadProdQM WITH(NOLOCK)
+	  WHERE PLANTCODE = @PLANTCODE
+	    AND INDATESEQ = @INDATESEQ
+
+-- TB_BadProdQMrec 검사 횟수 채번
+	DECLARE @LI_CHKNO INT
+   	 SELECT @LI_CHKNO = ISNULL(MAX(CHKNO),0) + 1
+	   FROM TB_BadProdQMrec WITH(NOLOCK)
+	  WHERE PLANTCODE = @PLANTCODE
+	    AND INDATESEQ = @INDATESEQ
+
+-- 입력 양품 = 남은 불량 수량 일 때
+	IF( @PRODQTY = @BADQTY )
+	BEGIN
+	-- 불량 재고 삭제
+		DELETE TB_BadProdQM
+	     WHERE PLANTCODE = @PLANTCODE
+		   AND INDATESEQ = @INDATESEQ
+	-- 불량 이력 추가 - 합격
+		INSERT INTO TB_BadProdQMrec
+			   ( PLANTCODE,       INDATESEQ,    LOTNO,     ORDERNO,     OUTCOME,
+				 WORKCENTERCODE,  WORKERID,     ITEMCODE,  PRODQTY,	    FIRSTBADQTY,
+				 BADQTY,          CHKNO,        MAKER,     MAKEDATE)
+		VALUES ( @PLANTCODE,      @INDATESEQ,   @LOTNO,    @ORDERNO,    '합격',
+				 @WORKCENTERCODE, @LS_WORKERID, @ITEMCODE, @PRODQTY,    @FIRSTBADQTY,
+				 '0',             @LI_CHKNO,    @WORKERID, @LD_NOWDATE)
+	END
+	
+	ELSE
+	BEGIN
+-- 차감
+		DECLARE @LI_BADQTY INT
+			SET @LI_BADQTY = @BADQTY - @PRODQTY
+	-- 불량 재고 차감
+		UPDATE TB_BadProdQM
+		   SET BADQTY	 = @LI_BADQTY
+		 WHERE PLANTCODE = @PLANTCODE
+	       AND INDATESEQ = @INDATESEQ
+	-- 불량 이력 추가
+		INSERT INTO TB_BadProdQMrec
+				( PLANTCODE,         INDATESEQ,        LOTNO,         ORDERNO,       OUTCOME,
+				  WORKCENTERCODE,    WORKERID,         ITEMCODE,      PRODQTY,       FIRSTBADQTY,
+				  BADQTY,            CHKNO,            MAKER,         MAKEDATE)	     
+		VALUES  ( @PLANTCODE,        @INDATESEQ,       @LOTNO,        @ORDERNO,      '부분합격',
+				  @WORKCENTERCODE,   @LS_WORKERID,     @ITEMCODE,     @PRODQTY,      @FIRSTBADQTY,
+				  @LI_BADQTY,        @LI_CHKNO,        @WORKERID,     @LD_NOWDATE)
+	END
+
+	SET @RS_CODE = 'S'
+END
